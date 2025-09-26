@@ -27,6 +27,7 @@ from langgraph._internal._constants import (
     NS_END,
     NS_SEP,
 )
+from langgraph.obs import make_langfuse_handler_from_env
 
 DEFAULT_RECURSION_LIMIT = int(getenv("LANGGRAPH_DEFAULT_RECURSION_LIMIT", "25"))
 
@@ -224,11 +225,19 @@ def get_callback_manager_for_config(
         return callbacks
     else:
         # otherwise create a new manager
-        return CallbackManager.configure(
+        manager = CallbackManager.configure(
             inheritable_callbacks=config.get("callbacks"),
             inheritable_tags=all_tags,
             inheritable_metadata=config.get("metadata"),
         )
+        # Optionally attach Langfuse handler based on env
+        try:
+            handler = make_langfuse_handler_from_env()
+        except Exception:
+            handler = None
+        if handler is not None:
+            manager.add_handler(handler, inherit=True)
+        return manager
 
 
 def get_async_callback_manager_for_config(
@@ -262,11 +271,19 @@ def get_async_callback_manager_for_config(
         return callbacks
     else:
         # otherwise create a new manager
-        return AsyncCallbackManager.configure(
+        manager = AsyncCallbackManager.configure(
             inheritable_callbacks=config.get("callbacks"),
             inheritable_tags=all_tags,
             inheritable_metadata=config.get("metadata"),
         )
+        # Optionally attach Langfuse handler based on env
+        try:
+            handler = make_langfuse_handler_from_env()
+        except Exception:
+            handler = None
+        if handler is not None:
+            manager.add_handler(handler, inherit=True)
+        return manager
 
 
 def _is_not_empty(value: Any) -> bool:
