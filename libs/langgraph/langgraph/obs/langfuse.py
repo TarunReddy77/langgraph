@@ -5,6 +5,7 @@ import json
 import os
 import time
 from typing import Any
+from urllib.parse import urlparse
 from uuid import UUID
 
 import requests
@@ -13,6 +14,7 @@ from langchain_core.messages import BaseMessage
 
 LANGFUSE_ENABLED_ENV = "LANGFUSE_ENABLED"
 LANGFUSE_HOST_ENV = "LANGFUSE_HOST"
+LANGFUSE_DSN_ENV = "LANGFUSE_DSN"  # Optional DSN: http://PUBLIC:SECRET@host:port
 LANGFUSE_PUBLIC_KEY_ENV = "LANGFUSE_PUBLIC_KEY"
 LANGFUSE_SECRET_KEY_ENV = "LANGFUSE_SECRET_KEY"
 LANGFUSE_INGESTION_PATH = "/api/public/ingestion"
@@ -25,7 +27,8 @@ def _basic_auth_header(public_key: str, secret_key: str) -> str:
 
 
 def _now_iso() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+    # RFC3339 / ISO8601 with UTC timezone suffix expected by Langfuse
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
 class _IngestionClient:
@@ -46,11 +49,42 @@ class _IngestionClient:
             return
         try:
             payload = {"batch": events}
-            requests.post(
+            resp = requests.post(
                 self.url, headers=self.headers, data=json.dumps(payload), timeout=5
             )
+            if os.getenv("LANGFUSE_DEBUG", "").lower() in {
+                "1",
+                "true",
+                "yes",
+                "verbose",
+            }:
+                try:
+                    print(
+                        f"[Langfuse] POST {self.url} status={resp.status_code} events={len(events)}",
+                        flush=True,
+                    )
+                    if (
+                        resp.status_code not in (200, 201)
+                        or os.getenv("LANGFUSE_DEBUG", "").lower() == "verbose"
+                    ):
+                        print(
+                            f"[Langfuse] response: {resp.text[:1000]}",
+                            flush=True,
+                        )
+                    if os.getenv("LANGFUSE_DEBUG", "").lower() == "verbose":
+                        print(
+                            f"[Langfuse] payload: {json.dumps(payload)[:1000]}",
+                            flush=True,
+                        )
+                except Exception:
+                    pass
         except Exception:
             # Best-effort; do not raise to avoid impacting user runs
+            if os.getenv("LANGFUSE_DEBUG", "").lower() in {"1", "true", "yes"}:
+                try:
+                    print("[Langfuse] Failed to POST events", flush=True)
+                except Exception:
+                    pass
             pass
 
 
@@ -240,7 +274,7 @@ class LangfuseIngestionHandler(BaseCallbackHandler):
         else:
             try:
                 if prompts and isinstance(prompts[0], list):
-                    inp: Any = {"prompts": ["".join(map(str, p)) for p in prompts]}  # type: ignore[index]
+                    inp: Any = {"prompts": ["".join(map(str, p)) for p in prompts]}
                 else:
                     inp = {"prompts": prompts}
             except Exception:
@@ -323,6 +357,58 @@ class LangfuseIngestionHandler(BaseCallbackHandler):
         ]
         self._client.post_events(events)
 
+    def on_chat_model_end(
+        self,
+        response: Any,
+        *,
+        run_id: UUID,
+        parent_run_id: UUID | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        if self._mode == "graph":
+            event = self._event(
+                "event-create",
+                {"id": str(run_id), "name": "chat_model_end", "status": "success"},
+            )
+            self._client.post_events([event])
+            return
+        key = str(run_id)
+        state = self._llm_state.pop(key, None) or {}
+        start_ts = state.get("start_ts")
+        latency_ms = int((time.time() - start_ts) * 1000) if start_ts else None
+        serialized = state.get("serialized", {})
+        usage, model = self._extract_usage_and_model(response, serialized)
+        output = self._pick_output_text(response)
+        input_payload = state.get("input")
+        tags = state.get("tags") or []
+
+        trace_id = str(run_id)
+        trace_body = {
+            "id": trace_id,
+            "name": "llm-completion",
+            "input": input_payload,
+            "output": output,
+            "metadata": {"model": model, "latency_ms": latency_ms},
+            "tags": tags,
+        }
+        gen_id = f"gen-{trace_id}"
+        gen_body = {
+            "id": gen_id,
+            "traceId": trace_id,
+            "name": "llm-step",
+            "model": model,
+            "input": input_payload,
+            "output": output,
+            "usage": usage or None,
+            "metadata": {"latency_ms": latency_ms},
+            "tags": tags,
+        }
+        events = [
+            self._event("trace-create", trace_body),
+            self._event("generation-create", gen_body),
+        ]
+        self._client.post_events(events)
+
     def on_llm_error(
         self,
         error: BaseException,
@@ -331,11 +417,94 @@ class LangfuseIngestionHandler(BaseCallbackHandler):
         parent_run_id: UUID | None = None,
         **kwargs: Any,
     ) -> Any:
+        if self._mode == "llm":
+            key = str(run_id)
+            state = self._llm_state.pop(key, None) or {}
+            start_ts = state.get("start_ts")
+            latency_ms = int((time.time() - start_ts) * 1000) if start_ts else None
+            input_payload = state.get("input")
+            tags = state.get("tags") or []
+            trace_id = str(run_id)
+            trace_body = {
+                "id": trace_id,
+                "name": "llm-completion-error",
+                "input": input_payload,
+                "output": {"error": repr(error)},
+                "metadata": {"latency_ms": latency_ms, "error": True},
+                "tags": tags,
+            }
+            err_event = self._event(
+                "event-create",
+                {
+                    "id": trace_id,
+                    "name": "llm_error",
+                    "status": "error",
+                    "error": repr(error),
+                },
+            )
+            self._client.post_events(
+                [
+                    self._event("trace-create", trace_body),
+                    err_event,
+                ]
+            )
+            return
         event = self._event(
             "event-create",
             {
                 "id": str(run_id),
                 "name": "llm_error",
+                "status": "error",
+                "error": repr(error),
+            },
+        )
+        self._client.post_events([event])
+
+    def on_chat_model_error(
+        self,
+        error: BaseException,
+        *,
+        run_id: UUID,
+        parent_run_id: UUID | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        if self._mode == "llm":
+            key = str(run_id)
+            state = self._llm_state.pop(key, None) or {}
+            start_ts = state.get("start_ts")
+            latency_ms = int((time.time() - start_ts) * 1000) if start_ts else None
+            input_payload = state.get("input")
+            tags = state.get("tags") or []
+            trace_id = str(run_id)
+            trace_body = {
+                "id": trace_id,
+                "name": "llm-completion-error",
+                "input": input_payload,
+                "output": {"error": repr(error)},
+                "metadata": {"latency_ms": latency_ms, "error": True},
+                "tags": tags,
+            }
+            err_event = self._event(
+                "event-create",
+                {
+                    "id": trace_id,
+                    "name": "chat_model_error",
+                    "status": "error",
+                    "error": repr(error),
+                },
+            )
+            self._client.post_events(
+                [
+                    self._event("trace-create", trace_body),
+                    err_event,
+                ]
+            )
+            return
+        event = self._event(
+            "event-create",
+            {
+                "id": str(run_id),
+                "name": "chat_model_error",
                 "status": "error",
                 "error": repr(error),
             },
@@ -350,9 +519,20 @@ def make_langfuse_handler_from_env() -> LangfuseIngestionHandler | None:
     """
     if os.getenv(LANGFUSE_ENABLED_ENV, "").lower() not in {"1", "true", "yes"}:
         return None
-    host = os.getenv(LANGFUSE_HOST_ENV)
-    public_key = os.getenv(LANGFUSE_PUBLIC_KEY_ENV)
-    secret_key = os.getenv(LANGFUSE_SECRET_KEY_ENV)
+    # Support DSN form: http://PUBLIC:SECRET@host:port
+    dsn = os.getenv(LANGFUSE_DSN_ENV)
+    if dsn:
+        try:
+            parsed = urlparse(dsn)
+            host = f"{parsed.scheme}://{parsed.hostname}:{parsed.port or 80}"
+            public_key = parsed.username or ""
+            secret_key = parsed.password or ""
+        except Exception:
+            host = public_key = secret_key = None  # type: ignore
+    else:
+        host = os.getenv(LANGFUSE_HOST_ENV)
+        public_key = os.getenv(LANGFUSE_PUBLIC_KEY_ENV)
+        secret_key = os.getenv(LANGFUSE_SECRET_KEY_ENV)
     if not host or not public_key or not secret_key:
         return None
     try:

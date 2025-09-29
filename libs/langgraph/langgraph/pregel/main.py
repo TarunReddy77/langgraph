@@ -30,8 +30,6 @@ from langchain_core.runnables import (
 from langchain_core.runnables.base import Input, Output
 from langchain_core.runnables.config import (
     RunnableConfig,
-    get_async_callback_manager_for_config,
-    get_callback_manager_for_config,
 )
 from langchain_core.runnables.graph import Graph
 from langgraph.cache.base import BaseCache
@@ -46,6 +44,8 @@ from typing_extensions import Self, Unpack, deprecated, is_typeddict
 
 from langgraph._internal._config import (
     ensure_config,
+    get_async_callback_manager_for_config,
+    get_callback_manager_for_config,
     merge_configs,
     patch_checkpoint_map,
     patch_config,
@@ -100,6 +100,7 @@ from langgraph.errors import (
     create_error_message,
 )
 from langgraph.managed.base import ManagedValueSpec
+from langgraph.obs import make_langfuse_handler_from_env
 from langgraph.pregel._algo import (
     PregelTaskWrites,
     _scratchpad,
@@ -2509,6 +2510,13 @@ class Pregel(
 
         config = ensure_config(self.config, config)
         callback_manager = get_callback_manager_for_config(config)
+        # Attach Langfuse handler if enabled via env (graph-level events)
+        try:
+            _lf = make_langfuse_handler_from_env()
+        except Exception:
+            _lf = None
+        if _lf is not None:
+            callback_manager.add_handler(_lf, inherit=True)
         run_manager = callback_manager.on_chain_start(
             None,
             input,
@@ -2779,6 +2787,13 @@ class Pregel(
 
         config = ensure_config(self.config, config)
         callback_manager = get_async_callback_manager_for_config(config)
+        # Attach Langfuse handler if enabled via env (graph-level events)
+        try:
+            _lf = make_langfuse_handler_from_env()
+        except Exception:
+            _lf = None
+        if _lf is not None:
+            callback_manager.add_handler(_lf, inherit=True)
         run_manager = await callback_manager.on_chain_start(
             None,
             input,
